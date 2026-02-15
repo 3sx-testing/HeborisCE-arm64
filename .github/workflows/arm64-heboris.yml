@@ -1,0 +1,205 @@
+name: Build Heboris (Linux ARM64 Cross-Compile RockNIX-style)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["main"]
+
+jobs:
+  build:
+    name: Build Heboris (Linux ARM64 via cross-compile)
+    runs-on: ubuntu-latest
+    container:
+      image: ubuntu:25.04
+
+    steps:
+      - name: Install Git and cross-compile toolchain (RockNIX-style arm64 apt)
+        run: |
+          set -euxo pipefail
+          apt-get update
+          apt-get install -y git curl xz-utils ca-certificates
+
+          # ARM64 packages live on ports.ubuntu.com, not archive.ubuntu.com.
+          dpkg --add-architecture arm64
+
+          # Pin existing DEB822 sources to amd64-only (ubuntu:25.04 format)
+          for f in /etc/apt/sources.list.d/*.sources; do
+              if [ -f "$f" ] && ! grep -q 'Architectures:' "$f"; then
+                  sed -i '/^Types:/a Architectures: amd64' "$f"
+              fi
+          done
+
+          # Add arm64 sources from ports.ubuntu.com
+          printf '%s\n' \
+              'deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports plucky main restricted universe multiverse' \
+              'deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports plucky-updates main restricted universe multiverse' \
+              'deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports plucky-security main restricted universe multiverse' \
+              > /etc/apt/sources.list.d/arm64-ports.list
+
+          apt-get update
+          apt-get install -y \
+            crossbuild-essential-arm64 cmake ninja-build make pkg-config clang zip file qemu-user-static
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      # --- ARM64 dev libs from ports.ubuntu.com (Wayland + ALSA) ---
+      - name: Install ARM64 build dependencies
+        run: |
+          set -euxo pipefail
+          apt-get install -y \
+            libasound2-dev:arm64 \
+            libwayland-dev:arm64 wayland-protocols \
+            libxkbcommon-dev:arm64 \
+            libdrm-dev:arm64 libgbm-dev:arm64 \
+            libegl1-mesa-dev:arm64 libgles2-mesa-dev:arm64
+
+      - name: Create CMake toolchain file (aarch64-linux-gnu)
+        run: |
+          set -euxo pipefail
+          mkdir -p cmake
+          cat > cmake/aarch64-linux-gnu.cmake << 'EOF'
+          set(CMAKE_SYSTEM_NAME Linux)
+          set(CMAKE_SYSTEM_PROCESSOR aarch64)
+
+          set(CMAKE_C_COMPILER aarch64-linux-gnu-gcc)
+          set(CMAKE_CXX_COMPILER aarch64-linux-gnu-g++)
+          set(CMAKE_AR aarch64-linux-gnu-ar)
+          set(CMAKE_RANLIB aarch64-linux-gnu-ranlib)
+          set(CMAKE_STRIP aarch64-linux-gnu-strip)
+
+          # Where we install our built deps (SDL2, SDL2_mixer)
+          set(CMAKE_FIND_ROOT_PATH ${CMAKE_SOURCE_DIR}/third_party/prefix)
+
+          set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
+          set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
+          set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
+          set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)
+          EOF
+
+      - name: Build SDL2 (aarch64 cross-compile)
+        run: |
+          set -euxo pipefail
+          mkdir -p third_party && cd third_party
+          mkdir -p prefix
+
+          # SDL2 release branch (NOT SDL3)
+          if [ ! -d "sdl2" ]; then
+            git clone --depth 1 --branch release-2.30.x https://github.com/libsdl-org/SDL.git sdl2
+          fi
+
+          cd sdl2
+          mkdir -p build && cd build
+
+          # Point pkg-config at arm64 .pc files so SDL2 finds Wayland/ALSA
+          export PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig
+          export PKG_CONFIG_LIBDIR=/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig
+
+          cmake .. -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE=${GITHUB_WORKSPACE}/cmake/aarch64-linux-gnu.cmake \
+            -DCMAKE_INSTALL_PREFIX=${GITHUB_WORKSPACE}/third_party/prefix \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=ON \
+            -DSDL_SHARED=ON -DSDL_STATIC=OFF \
+            -DSDL_WAYLAND=ON -DSDL_X11=OFF
+
+          cmake --build . -j$(nproc)
+          cmake --install .
+
+      - name: Build SDL2_mixer (WAV-only, aarch64 cross-compile)
+        run: |
+          set -euxo pipefail
+          mkdir -p third_party && cd third_party
+
+          if [ ! -d "sdl2_mixer" ]; then
+            git clone --depth 1 --branch release-2.8.x https://github.com/libsdl-org/SDL_mixer.git sdl2_mixer
+          fi
+
+          cd sdl2_mixer
+          mkdir -p build && cd build
+
+          export PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig
+          export PKG_CONFIG_LIBDIR=/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig
+
+          cmake .. -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE=${GITHUB_WORKSPACE}/cmake/aarch64-linux-gnu.cmake \
+            -DCMAKE_PREFIX_PATH=${GITHUB_WORKSPACE}/third_party/prefix \
+            -DCMAKE_INSTALL_PREFIX=${GITHUB_WORKSPACE}/third_party/prefix \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=ON \
+            -DSDL2MIXER_WAV=ON \
+            -DSDL2MIXER_OGG=OFF \
+            -DSDL2MIXER_MP3=OFF \
+            -DSDL2MIXER_FLAC=OFF \
+            -DSDL2MIXER_MID=OFF \
+            -DSDL2MIXER_MOD=OFF \
+            -DSDL2MIXER_OPUS=OFF
+
+          cmake --build . -j$(nproc)
+          cmake --install .
+
+      - name: Build Heboris for Linux ARM64
+        run: |
+          set -euxo pipefail
+
+          # Make sure CMake finds our prefix first
+          export PKG_CONFIG_PATH=${GITHUB_WORKSPACE}/third_party/prefix/lib/pkgconfig:${GITHUB_WORKSPACE}/third_party/prefix/share/pkgconfig:/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig
+          export PKG_CONFIG_LIBDIR=/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig
+
+          cmake -B build-linux-arm64 -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE=cmake/aarch64-linux-gnu.cmake \
+            -DCMAKE_PREFIX_PATH=${GITHUB_WORKSPACE}/third_party/prefix
+
+          cmake --build build-linux-arm64 --parallel 2>&1 | tee build.log
+
+      - name: Package (PortMaster layout)
+        run: |
+          set -euxo pipefail
+          mkdir -p dist/heboris-sdl/libs
+
+          # Try to locate the built Heboris executable and force the PortMaster-expected name.
+          BIN="$(find build-linux-arm64 -maxdepth 3 -type f -executable \( -name 'Heboris*' -o -name 'heboris*' \) | head -n 1)"
+          if [ -z "${BIN:-}" ]; then
+            echo "ERROR: Could not find Heboris executable in build-linux-arm64"
+            find build-linux-arm64 -maxdepth 3 -type f -print
+            exit 1
+          fi
+
+          cp -v "$BIN" dist/heboris-sdl/HeborisC7EX-SDL2
+
+          # Copy resources if your repo has them
+          if [ -d "res" ]; then
+            cp -av res dist/heboris-sdl/
+          fi
+
+          # Bundle libs that the PortMaster script expects to pick up from $GAMEDIR/libs
+          cp -av third_party/prefix/lib/libSDL2-2.0.so* dist/heboris-sdl/libs/ || true
+          cp -av third_party/prefix/lib/libSDL2_mixer-2.0.so* dist/heboris-sdl/libs/ || true
+
+          # Show what we packaged
+          find dist -maxdepth 4 -type f -print
+
+          (cd dist && tar -czf ../heboris-sdl-linux-arm64.tar.gz heboris-sdl)
+
+      - name: Upload ARM64 build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: heboris-sdl-linux-arm64
+          path: heboris-sdl-linux-arm64.tar.gz
+          if-no-files-found: error
+
+      - name: Verify binary architecture
+        run: |
+          set -euxo pipefail
+          file dist/heboris-sdl/HeborisC7EX-SDL2
+          file dist/heboris-sdl/HeborisC7EX-SDL2 | grep -q "aarch64" && echo "✅ ARM64 binary confirmed" || (echo "❌ Not an ARM64 binary!" && exit 1)
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-arm64-heboris
+          path: build.log
